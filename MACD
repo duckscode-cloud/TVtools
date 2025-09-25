@@ -1,0 +1,248 @@
+/@version=6
+strategy("Topstep MACD v2.2 (HTF confirm + lean filters)",
+     overlay=true,
+     initial_capital=50000,
+     pyramiding=0,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=2.75, // ES per side; ~0.70 for MES
+     slippage=1,
+     calc_on_order_fills=true,
+     calc_on_every_tick=false) // set true for live/paper so kill-switches act intrabar
+
+//=========== Inputs ===========
+fastLen         = input.int(12, "MACD Fast length", minval=1)
+slowLen         = input.int(26, "MACD Slow length", minval=1)
+sigLen          = input.int(9,  "MACD Signal length", minval=1)
+
+// Trend filter (LTF)
+useTrendFilter  = input.bool(true,  "Use EMA trend filter (LTF)")
+trendFastLen    = input.int(50, "Trend EMA Fast (LTF)", minval=1)
+trendSlowLen    = input.int(200,"Trend EMA Slow (LTF)", minval=1)
+
+// HTF confirmation (new)
+useHTF          = input.bool(true,  "Use Higher-TF confirmation")
+htfRes          = input.string("5", "HTF timeframe (min)", tooltip="e.g. 5 = 5-minute for ES 1m chart")
+htfFastLen      = input.int(50, "HTF EMA Fast", minval=1)
+htfSlowLen      = input.int(200,"HTF EMA Slow", minval=1)
+useHTFMACD      = input.bool(true, "Require HTF MACD regime with trend")
+
+// Slope gate (LTF, ATR-normalized)
+useSlope        = input.bool(true,  "Require EMA slope (ATR-normalized)")
+slopeLen        = input.int(20,  "Slope lookback (bars)", minval=2)
+slopeMinATR     = input.float(0.06, "Min |slope| as ATRs per bar", step=0.01)
+
+// MACD strength threshold (new, ATR-normalized)
+useDeltaThresh  = input.bool(false, "Require MACD strength (ATR-normalized)")
+deltaMinATR     = input.float(0.04, "Min |delta| as ATRs", step=0.01, tooltip="0.04–0.08 typical")
+
+// ADX / DMI
+useADX          = input.bool(true,  "Filter by ADX (via DMI)")
+dmiLen          = input.int(14, "DMI Length", minval=1)
+adxSmoothing    = input.int(14, "ADX Smoothing", minval=1)
+adxMin          = input.int(22,  "Min ADX", minval=1)
+
+// Sessions / time boxes (optional)
+tradeRTH        = input.bool(true,  "Trade RTH only")
+sessionRTH      = input.session("0830-1500", "RTH Session (exchange time)")
+useTimeBoxes    = input.bool(false, "Use extra time windows (inside RTH)")
+sessionBox1     = input.session("0835-1015", "Window 1 (CT)")
+sessionBox2     = input.session("1305-1455", "Window 2 (CT)")
+
+// Cooldown / daily limits
+cooldownBars    = input.int(4, "Cooldown bars after entry", minval=0)
+maxTradesDay    = input.int(8, "Max trades per day", minval=1)
+
+dailyLossStop   = input.float(-500, "Daily Loss Stop ($)", step=25)
+dailyProfitLock = input.float(1500, "Daily Profit Lock ($, optional)", step=25)
+equityDDStop    = input.float(1500, "Global equity DD stop ($)", step=50)
+
+// Risk sizing
+riskPerTrade    = input.float(120, "Per-trade $ risk (ES≈120)", step=5)  // 150 -> 120 for Topstep cushion
+atrLen          = input.int(14, "ATR Length", minval=1)
+atrMult         = input.float(1.25, "Stop = max(ATR*x, $risk-based)", step=0.25)
+tpR             = input.float(1.6,  "Take-profit (R multiple)", step=0.1)
+maxContracts    = input.int(3, "Max contracts", minval=1, maxval=50)
+minStopTicks    = input.int(3, "Min stop (ticks)", minval=1)
+
+// Volatility floor
+minAtrTicks     = input.int(4, "Min ATR (ticks) to trade", minval=0)
+
+// Breakeven + trailing
+useBE           = input.bool(true,  "Move to breakeven after R trigger")
+beTriggerR      = input.float(0.8,  "BE trigger (R)", step=0.1)
+beOffsetTicks   = input.int(1, "BE offset (ticks)", minval=0)
+
+useTrail        = input.bool(true,  "Trail after larger R trigger")
+trailTriggerR   = input.float(1.2,  "Trail trigger (R)", step=0.1)
+trailAtrMult    = input.float(0.8,  "Trail distance = ATR*x", step=0.1)
+
+// Timed exit (new)
+useTimedExit    = input.bool(true,  "Force close after N bars if not hit stop/target")
+maxBarsInTrade  = input.int(90, "Max bars in trade (1m=~90min)", minval=10)
+
+allowLongs      = input.bool(true,  "Allow Longs")
+allowShorts     = input.bool(true,  "Allow Shorts")
+
+//=========== Signals (LTF) ===========
+macd    = ta.ema(close, fastLen) - ta.ema(close, slowLen)
+macdSig = ta.ema(macd, sigLen)
+delta   = macd - macdSig
+longSignal  = ta.crossover(delta, 0)
+shortSignal = ta.crossunder(delta, 0)
+
+// LTF trend + slope
+emaFastT  = ta.ema(close, trendFastLen)
+emaSlowT  = ta.ema(close, trendSlowLen)
+trendUp   = emaFastT > emaSlowT
+trendDn   = emaFastT < emaSlowT
+atr       = ta.atr(atrLen)
+slopePts  = emaFastT - emaFastT[slopeLen]
+slopeATR  = (slopePts / slopeLen) / atr
+
+trendOKLong  = not useTrendFilter or trendUp
+trendOKShort = not useTrendFilter or trendDn
+slopeOKLong  = not useSlope or (slopeATR >  slopeMinATR)
+slopeOKShort = not useSlope or (slopeATR < -slopeMinATR)
+deltaOK      = not useDeltaThresh or (math.abs(delta) / atr >= deltaMinATR)
+
+// HTF confirmation
+htfEmaFast = request.security(syminfo.tickerid, htfRes, ta.ema(close, htfFastLen),  barmerge.gaps_off, barmerge.lookahead_off)
+htfEmaSlow = request.security(syminfo.tickerid, htfRes, ta.ema(close, htfSlowLen),  barmerge.gaps_off, barmerge.lookahead_off)
+htfTrendUp = htfEmaFast > htfEmaSlow
+htfTrendDn = htfEmaFast < htfEmaSlow
+htfMacd    = request.security(syminfo.tickerid, htfRes, ta.ema(close, fastLen) - ta.ema(close, slowLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfSig     = request.security(syminfo.tickerid, htfRes, ta.ema(htfMacd, sigLen),                            barmerge.gaps_off, barmerge.lookahead_off)
+htfDelta   = htfMacd - htfSig
+htfLongOK  = not useHTF or (htfTrendUp and (not useHTFMACD or htfDelta > 0))
+htfShortOK = not useHTF or (htfTrendDn and (not useHTFMACD or htfDelta < 0))
+
+// ADX
+[_, _, adxVal] = ta.dmi(dmiLen, adxSmoothing)
+strengthOK = not useADX or (adxVal > adxMin)
+
+// Sessions / time boxes
+inRTH   = not tradeRTH or not na(time(timeframe.period, sessionRTH))
+inBoxes = not useTimeBoxes or (not na(time(timeframe.period, sessionBox1)) or not na(time(timeframe.period, sessionBox2)))
+inSession = inRTH and inBoxes
+
+// Day / DD guards
+var float dayStartEquity = na
+var int   tradesToday    = 0
+newDay = ta.change(time("D")) != 0
+if newDay
+    dayStartEquity := strategy.equity
+    tradesToday    := 0
+dayNet = strategy.equity - nz(dayStartEquity, strategy.equity)
+
+var float eqHigh = na
+eqHigh := na(eqHigh) ? strategy.equity : math.max(eqHigh, strategy.equity)
+eqDD   = eqHigh - strategy.equity
+
+canTradeToday = (dayNet > dailyLossStop) and (dayNet < dailyProfitLock) and (tradesToday < maxTradesDay)
+canTrade      = canTradeToday and (eqDD < equityDDStop) and inSession
+
+// Risk sizing
+pointValue = nz(syminfo.pointvalue, 50.0) // ES=50
+stopPtsByDollar = riskPerTrade / pointValue
+atrStopPts      = atrMult * atr
+minStopPts      = minStopTicks * syminfo.mintick
+baseStop        = math.max(stopPtsByDollar, atrStopPts)
+stopPts         = na(baseStop) or baseStop <= 0 ? minStopPts : math.max(baseStop, minStopPts)
+
+atrTicks = atr / syminfo.mintick
+volOK    = atrTicks >= minAtrTicks
+
+qtyFromRisk = math.floor(math.max(1, riskPerTrade / (stopPts * pointValue)))
+qty         = math.min(qtyFromRisk, maxContracts)
+qty         := math.max(1, qty)
+
+// Entries
+var int lastEntryBar = na
+cooldownOK = na(lastEntryBar) or (bar_index - lastEntryBar) > cooldownBars
+flat       = strategy.position_size == 0
+
+enterLong  = allowLongs  and canTrade and volOK and cooldownOK and strengthOK and deltaOK and trendOKLong  and slopeOKLong  and htfLongOK  and longSignal  and flat
+enterShort = allowShorts and canTrade and volOK and cooldownOK and strengthOK and deltaOK and trendOKShort and slopeOKShort and htfShortOK and shortSignal and flat
+
+if enterLong
+    strategy.entry("L", strategy.long, qty)
+    lastEntryBar := bar_index
+    tradesToday += 1
+
+if enterShort
+    strategy.entry("S", strategy.short, qty)
+    lastEntryBar := bar_index
+    tradesToday += 1
+
+// Track entry bars
+var int longEntryBar  = na
+var int shortEntryBar = na
+if strategy.position_size > 0 and strategy.position_size[1] <= 0
+    longEntryBar := bar_index
+if strategy.position_size < 0 and strategy.position_size[1] >= 0
+    shortEntryBar := bar_index
+if strategy.position_size <= 0
+    longEntryBar := na
+if strategy.position_size >= 0
+    shortEntryBar := na
+
+// Exits (BE + trail + timed)
+var float longStop  = na
+var float shortStop = na
+var float longTP    = na
+var float shortTP   = na
+longStop  := na
+shortStop := na
+longTP    := na
+shortTP   := na
+
+if strategy.position_size > 0
+    avg = strategy.position_avg_price
+    longStop := avg - stopPts
+    longTP   := avg + (tpR * stopPts)
+    rLong = (close - avg) / stopPts
+    if useBE and rLong >= beTriggerR
+        be = avg + beOffsetTicks * syminfo.mintick
+        longStop := math.max(longStop, be)
+    if useTrail and rLong >= trailTriggerR
+        lenSince = int(math.max(1, (bar_index - nz(longEntryBar, bar_index)) + 1))
+        hh = ta.highest(high, lenSince)
+        trailStop = hh - (trailAtrMult * atr)
+        longStop := math.max(longStop, trailStop)
+    // timed exit
+    if useTimedExit
+        lenSince = int(math.max(1, (bar_index - nz(longEntryBar, bar_index)) + 1))
+        if lenSince >= maxBarsInTrade
+            strategy.close("L")
+    strategy.exit("Lx", "L", stop = longStop, limit = longTP)
+
+if strategy.position_size < 0
+    avg = strategy.position_avg_price
+    shortStop := avg + stopPts
+    shortTP   := avg - (tpR * stopPts)
+    rShort = (avg - close) / stopPts
+    if useBE and rShort >= beTriggerR
+        be = avg - beOffsetTicks * syminfo.mintick
+        shortStop := math.min(shortStop, be)
+    if useTrail and rShort >= trailTriggerR
+        lenSince = int(math.max(1, (bar_index - nz(shortEntryBar, bar_index)) + 1))
+        ll = ta.lowest(low, lenSince)
+        trailStop = ll + (trailAtrMult * atr)
+        shortStop := math.min(shortStop, trailStop)
+    if useTimedExit
+        lenSince = int(math.max(1, (bar_index - nz(shortEntryBar, bar_index)) + 1))
+        if lenSince >= maxBarsInTrade
+            strategy.close("S")
+    strategy.exit("Sx", "S", stop = shortStop, limit = shortTP)
+
+// Hard day/equity stops
+hitDailyStop = dayNet <= dailyLossStop
+hitGlobalDD  = eqDD   >= equityDDStop
+if (hitDailyStop or hitGlobalDD)
+    strategy.close("L")
+    strategy.close("S")
+
+// Plots
+plot(emaFastT, "EMA Fast (LTF)", color=color.new(color.teal, 0))
+plot(emaSlowT, "EMA Slow (LTF)", color=color.new(color.orange, 0))
+bgcolor(not inSession ? color.new(color.gray, 88) : na)
